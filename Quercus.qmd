@@ -1,0 +1,1075 @@
+---
+title: "Quercus Full Script"
+format: html
+editor: visual
+---
+
+## Packages
+
+Load all of these, installing if necessary
+
+```{r}
+library(tidyverse)
+library(sf)
+library(ggplot2)
+library(ggnewscale)
+library(viridis)
+library(terra)
+library(CoordinateCleaner) # Occurrence data cleaning
+library(SDMtune) # SDM workhorse package
+library(furrr) # Parallel processing
+library(blockCV) # For SDM Spatial cross-validation folds
+library(SDMtune)
+library(usdm)
+library(geodata)
+library(spocc)
+library(plotROC)
+library(dplyr)
+```
+
+## Settings
+
+These can generally stay the same for every script, just change the species name so things print right. Not changing it won't affect anything permanent, just how things are printed while the script is running
+
+```{r}
+# Geometry type to use accross all rasters
+crs_epsg <- 4326 #this code is standard WGS84 settings
+crs_code <- sprintf("epsg:%s", crs_epsg)
+
+# List of species to model 
+species_list <- c("Quercus agrifolia") #CHANGE
+
+# Number of background points
+n_bg_points <- 10000
+```
+
+This is setting your file paths and where everything will save to, just go through and change every "species" to your specific species and the "date" to today's date
+
+```{r}
+results_dir <- "~/R/Results/Quercus/03Jul25" # <-- CHANGE this to your desired output directory
+data_dir <- "~/R/Data/Quercus/03Jul25" # <-- CHANGE, this is where you will put all the data you used for this SDM
+
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE) #<--- creates the directory you just set in case it doesnt exist already
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE) #<--- creates the directory you just set in case it doesnt exist already
+```
+
+## Load Data
+
+### Species Occurrence Data
+
+This script is set up to take data downloaded as a "csv" from GBIF, as they actually save as tsv's for whatever reason. The long/lat names should already be saves as decimalLongitude, decimalLatitude. If not, change those before running the cleaning pipeline using the dplyr::rename() function.
+
+The file you downloaded should already only include rows with the dates, species, and record types you want, all specified in the iNat or GBIF download helper.
+
+```{r}
+data_raw <- read_tsv("~/R/Data/Q_agrifolia.csv") #CHANGE to whatever your file path is. You can also change
+
+clean_occ_df <- data_raw |>
+  as_tibble() |> #change to a table for easier editing and reading
+  cc_val() |> # Identify Invalid lat/lon Coordinates
+  cc_equ() |> # Identify Records with Identical lat/lon
+  cc_cap() |> # Identify Coordinates in Vicinity of Country Capitals. Note that this function defaults to anythign in a 10kM radius, changeable as needed.
+  cc_cen() |> # Identify Coordinates in Vicinity of Country and Province Centroids, default is w/i 1kM
+  # cc_coun(iso3 = "USA")|> # Identify Coordinates Outside their Reported Country
+  cc_gbif() |>   # Identify Records erroneously Assigned to GBIF Headquarters
+  cc_inst() |> # Identify Records in the Vicinity of Biodiversity Institutions; zoos, botanical gardens, herbaria, universities and museums, to w/i 100m
+  cc_sea() |>   # Identify Non-terrestrial Coordinates, change if doing oceanic spp
+  cc_zero() |>  # Identify Zero Coordinates
+  cc_outl() |> # Identify Geographic Outliers in Species Distributions. Using the standard quantile method; boxplot method is used and records are flagged as outliers if their mean distance to all other records of the same species is larger than mltpl * the interquartile range of the mean distance of all records of this species
+  cc_dupl()|> # Identify Duplicated Records
+  filter(coordinateUncertaintyInMeters <= 500 | is.na(coordinateUncertaintyInMeters))|>   # Filter out records with high positional uncertainty, also doable in the download menu
+  dplyr::filter(basisOfRecord == "HUMAN_OBSERVATION")
+  
+unique(clean_occ_df$basisOfRecord) #should show ONLY human observation
+
+clean_occ_sf <- clean_occ_df |>   # Now convert back to sf object
+  st_as_sf(
+    coords = c("decimalLongitude", "decimalLatitude"), #set coordinate columns
+    crs = crs_epsg,
+    remove = F
+  )
+
+points <- clean_occ_sf|> #pull out just the occurence points for graphing
+  select(decimalLongitude, decimalLatitude)
+```
+
+#### Graph for a gut check
+
+To make sure everything was converted correctly, do some basic graphing to make sure the mapping machinery and points are working.
+
+```{r}
+usa <- read_sf("~/R/Data/USA") #CHANGE this to the directory where you store this
+
+ggplot() +
+  geom_sf(data = usa, color = "black") +
+  geom_sf(data = points, color = "red", size = .2) +
+  theme_minimal() +
+  labs(title = "Map of USA with Points") #are the points in the right spots?
+```
+
+#### Create a mask
+
+This step creates a polygon around your points, with a buffer of 50km. This mask is used to define the study area, preventing the model from predicting occurences in places where they make no geographic sense due to lack of pollinators, hosts, etc (for example, the highly endemic Pseudotsuga macrocarpa ~only~ occurs in southern california, even though analyzing only its climate requirements may lead a model to believe that it also could be found in africa or the middle east). This mask should only and entirely include areas that it is ~possible~ for the species to spread to, so if there is poor sampling of the species or it is highly invasive, it may be wise to increase the buffer or create a mask using a different method entirely (ex: ecoregions)
+
+```{r}
+custom_mask <- clean_occ_sf$geometry |>
+  st_union() |>
+  st_convex_hull() |>
+  st_transform(3310) |> #this converts it to an area-preservation geometry so we can then make a buffer based on distance, not degrees.
+  st_buffer(50000) |>   #add a buffer of 50km
+  st_make_valid() |>
+  st_transform(crs(clean_occ_sf))|>
+  st_as_sf()
+```
+
+### Environmental Data
+
+#### Download data (if needed)
+
+If you have already downloaded these data, NO NEED TO DO IT AGAIN. Otherwise, run this code and save it to the data folder in your R session. This may take a while btw.
+
+```{r}
+# bioclim_global.stack <- geodata::worldclim_global(
+#   var = "bio",
+#   res = 0.5, #note the high (30 second) resolution
+#   path = "~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/data"
+# )
+```
+
+#### Load climate data
+
+If you already have it downloaded
+
+```{r}
+bioclim_global.stack <- list.files("~/R/Data/wc2.1_30s", full.names = T) |> 
+  rast() #stack and raserize all 19 layers of climate data
+
+names(bioclim_global.stack) <- c( # this feels wrong and messy but trust these are the right names
+  "MAT", "MeanDiurnalRange", "Isothermality", "TempSeasonality",
+  "MaxTempWarmestMonth", "MinTempColdestMonth", "TempAnnualRange",
+  "MeanTempWettestQuarter", "MeanTempDriestQuarter", "MTWQ",
+  "MTCQ", "MAP", "PrecipitationWettestMonth",
+  "PrecipitationDriestMonth", "PrecipitationSeasonality",
+  "PrecipitationWettestQuarter", "PrecipitationDriestQuarter",
+  "PrecipitationWarmestQuarter", "PrecipitationColdestQuarter"
+) #this just makes the names of the columns make syntactic sense. Not necessary.
+
+bio_data <- crop(bioclim_global.stack, custom_mask, mask = TRUE)|>
+  project(y=crs_code)
+  #bio data cropped down to the size of your mask
+
+head(bio_data) #should show readable variable names
+hasValues(bio_data) #should be trie
+summary(bio_data)
+```
+
+#### Land cover data
+
+These data are downloaded from https://www.mrlc.gov/data/north-american-land-change-monitoring-system at 30m resolution.
+
+```{r}
+land_data_raw <- terra::rast("~/R/Data/NA_NALCMS_landcover_2020v2_30m.tif")
+
+land_data_raw <- land_data_raw|>
+  project(y=bio_data,
+          method = "mode") #this projects it to the same epsg as the biodata AND it resamples it to the same resolution!! this may take a long long time beware go get a snack and if its still not done when you come back terminate r and try it again and it usually does it instantly somehow
+
+levels(land_data_raw) #sometimes these dont load with readable titles - if not, run code below
+
+land_levels <- data.frame(
+  ID = 0:19,
+  Class_EN = c(
+    NA,
+    "Temperate or Subpolar Needleleaf Forest",
+    "Subpolar Taiga Needleleaf Forest",
+    "Tropical or Subtropical Broadleaf Evergreen Forest",
+    "Tropical or Subtropical Broadleaf Deciduous Forest",
+    "Temperate or Subpolar Broadleaf Deciduous Forest",
+    "Mixed Forest",
+    "Tropical or Subtropical Shrubland",
+    "Temperate or Subpolar Shrubland",
+    "Tropical or Subtropical Grassland",
+    "Temperate or Subpolar Grassland",
+    "Subpolar or Polar Shrubland-Lichen-Moss",
+    "Subpolar or Polar Grassland-Lichen-Moss",
+    "Subpolar or Polar Barren-Lichen-Moss",
+    "Wetland",
+    "Cropland",
+    "Barren Lands",
+    "Urban",
+    "Water",
+    "Snow and Ice"
+  )
+)
+
+land_data_raw <- as.factor(land_data_raw)
+levels(land_data_raw) <- list(land_levels) #should preserve level names (?)
+
+land_data_cropped <- crop(land_data_raw, custom_mask, mask = TRUE) #cropping transformed mask and data 
+
+# hasValues(land_data_cropped) #should return TRUE
+# 
+plot(land_data_cropped) #OKAY what is happening is that (look at levels(land_data_cropped)) the level IDs are different than their row numbers and the graph is basing the legend off of the rows while the names are associated with the IDs and tbh i dont know how to fix this it wont take mutate or anythign like that
+# 
+# print(land_data_cropped) 
+# print(bio_data) #both should print as a SpatRaster with the EXACT same extents and coord ref systems
+```
+
+### Predictor raster
+
+Finally!! Smush everything together into a single predictors spatraster
+
+```{r}
+predictors <- c(land_data_cropped, bio_data)
+```
+
+#### Gut check
+
+```{r}
+class(predictors) #should return spatraster
+
+hasValues(predictors) #should return TRUE
+
+terra::plot(predictors[[3]]) #here, the first layer should return your land types. Try any layer 1-20. Note that sometimes the names of the land types get switched around for somereason. This doesn't matter for the modeling, but may look confusing.
+```
+
+## Check Co-linearity of Variables
+
+ADD A CHECK FOR COLINEARITY OF LAND USAGE TYPE, ANOVA??
+
+### Pearson Correlation Coefficient
+
+First, find the pearson correlation coefficient for each pair of numeric layers, aka all the environmental data.
+
+```{r}
+correlation_coef <- layerCor(bio_data, fun = "cor", na.rm = TRUE) 
+
+cor_coef <- correlation_coef[[1]] |>
+  as.table() |>
+  as.data.frame()
+
+write.csv(file.path(data_dir, "correlations.csv"), row.names = FALSE)
+
+sig_cor <- cor_coef|>
+  filter(Var1 != Var2, abs(Freq) > 0.95 & abs(Freq) < 1) #isolate things with significant (default: a = 0.05) correlation
+
+print(sig_cor) #this are all the significant correlations
+```
+
+Now plot the correlations. Boldness of the cell relates to strength of the correlation between variables.
+
+```{r}
+ggcorrelation <- ggplot(cor_coef, aes(Var1, Var2, fill = Freq)) + #plot the correlations - bold = significance
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "red", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Pearson Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  coord_fixed()
+
+print(ggcorrelation)
+  
+ggsave(file.path(data_dir, "plot_correlations.png"), plot = ggcorrelation, device = "png", width = 6, height = 5, dpi = 300)
+```
+
+This code will produce a list of variables that, if removed, will most decrease the correlations. This should be interpreted in light of the natural history of your species, not followed as rule of law. Skip down to the Remove Variables section to do so.
+
+```{r}
+vars_to_remove <- caret::findCorrelation(correlation_coef$cor, cutoff = 0.95, names = TRUE) 
+view(vars_to_remove)
+```
+
+### VIF
+
+The VIF of a predictor is a measure for how easily it is predicted from a linear regression using the other predictors, aka it helps detect and manage multicollinearity among predictor variables. A high VIF (typically \> 5 or 10) means a variable is highly collinear with others, and can lead the model to overfit to noise rather than true ecological signals.
+
+```{r}
+vif_results <- vif(x = bio_data) #it will do it, but it won't do anything with the land data
+
+view(vif_results)
+
+write.csv(vif_results, file.path(data_dir, "vif_results.csv"))
+
+print(vif_results)
+
+sig_vif <- vif_results|>
+  filter(VIF > 10)
+
+view(sig_vif)
+```
+
+### Remove Variables
+
+After using both pearson and VIF, you should have a decent idea of which numeric ecological variabes are correlated with eachother. Variables listed in both sig_vif and vars_to_remove may be good canidates for removal if they are ecologically less important for your spoecies. Decide if it is sufficient to remove the most correlated variables, or if that will get rid of biologically important variables. SDMs are useless if there is no interpretation of the environmental variables used to train it, so now is the time to do lit review, reflect on the usage of the SDM (ex: if you are trying to inform water usage policy, you should probably keep MAP in even if it is the most correlated variable) and decide which variables are most informative.
+
+To look at just a few variables, use this code. It really should be just a few, such as the variables in the vars_to_remove list, as it will produce a nxn matrix of plots, depending on n variables you select.
+
+```{r}
+names(predictors) #use this to get the exact layer names you want to isolate
+
+predictors_single <- predictors|>
+  subset(c("MAP", "MeanDiurnalRange", "PrecipitationColdestQuarter")) #change this to whatever you want
+
+raster::pairs(predictors_single, cex = 0.1, fig = TRUE, hist = FALSE)
+```
+
+If you choose to remove some variables, use this code to do so
+
+```{r}
+predictors <- predictors[[!names(predictors) %in% c("MAP", "PrecipitationColdestQuarter")]] #CHANGE these names to whatever you want to remove
+```
+
+## SDM Function
+
+### Training
+
+This function creates a bias raster, picks background points, makes the model, etc.
+
+```{r}
+train_sdm <- function(
+    species_name, clean_occ_sf, predictors, results_dir,
+    n_bg_points = 10000, n_folds = 5, modelmethod = "Maxnet") {
+  
+  message("\n--- Modeling: ", species_name, " ---") 
+  species_dir <- file.path(results_dir, gsub(" ", "_", species_name))
+  dir.create(species_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  if (!terra::same.crs(predictors, st_as_sf(clean_occ_sf))) {
+    stop("CRS mismatch between predictors and occurrences.")
+    }
+  
+  message("\n--- Creating Bias Raster for: ", species_name, " ---") 
+  
+  # Thin occurrences to one per raster cell
+  occ_thinned <- clean_occ_sf |> 
+    mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |>
+    group_by(cell) |>
+    sample_n(1) |>
+    ungroup()
+  
+  coords <- st_coordinates(occ_thinned) #COORDS OF WHERE SPP DOES AND DOESNT OCCUR, NOT COUNTS
+  empty_rast <- predictors[[1]]
+  
+  point_dens <- MASS::kde2d(coords[, 1], coords[, 2], #POINT_DENS IS A KDE
+  n = c(ncol(empty_rast), nrow(empty_rast)),
+  lims = ext(empty_rast) |> as.vector()
+  )
+  point_dens_df <- expand.grid(x = point_dens$x, y = point_dens$y, KEEP.OUT.ATTRS = FALSE)
+  point_dens_df$z <- as.vector(point_dens$z)
+  
+  density_rast <- rast(point_dens_df, type = "xyz", crs = crs(predictors)) |>
+    project(crs(predictors))
+  
+  bias_rast <- density_rast |>
+    resample(predictors, method = "bilinear") |>  # align extent & resolution exactly
+    mask(predictors)
+
+  # Generate background points using bias raster
+  bias_sampled_cells <- sample( # Sample randomly using point density bias
+    x = which(!is.na(values(bias_rast))), # Cells with non-NA values
+    size = n_bg_points, # Number of background points to sample
+    prob = values(bias_rast)[!is.na(values(bias_rast))]) # Probability of sampling each cell, 
+
+  # Get lonlats of bias selected cells
+  bg_df <- xyFromCell(predictors[[1]], cell = bias_sampled_cells)|>
+    as_tibble() |>
+    dplyr::select(x, y)
+    
+  # Combine occurrences and background points, and add Y column where 1 = occurrence, 0 = background
+  all_points <- occ_thinned |>
+    st_drop_geometry() |> #drops the geometry of its argument 
+    dplyr::select(x = decimalLongitude, y = decimalLatitude) |> 
+    mutate(Y = 1) |> 
+    bind_rows(bg_df |> mutate(Y = 0))
+
+  # Prepare SWD object for SDMtune
+  sdm_data <- prepareSWD( #THIS FUNCTION CREATES AN OBJECT THAT HAS SP NAME, COORDS, AND VALUES OF ENV VAR AT LOCATIONS
+    species = species_name,
+    p = all_points |> filter(Y == 1) |> dplyr::select(x, y), 
+    a = all_points |> filter(Y == 0) |> dplyr::select(x, y), 
+    env = predictors 
+  )
+
+  # Need to make sure cv_spatial is using exactly the points that prepareSWD kept
+  sdm_data_pts <- sdm_data@coords |> 
+    cbind(PA = sdm_data@pa) |> 
+    st_as_sf(coords = c("X", "Y"), crs = crs(occ_thinned), remove = FALSE)
+
+  #Now we have to get a little nasty to work around the fact that cv_spatial is going to try to plot both numeric and categorical data on the same plot and for some stupid reason there is no option to bypass the plotting that is built in to the function. so we are going to TEMPORARILY convert the categorical variable to numberic, then after we fold it, we are going to convert it back. this i thiiiink is valid because this step is only about assigning fold IDs, not anything that has to do with distance or order. 
+  
+  #browser()
+  
+  cat_layers <- which(sapply(1:nlyr(predictors), function(i) is.factor(predictors[[i]]))) #identify the categorical layers! we know this already, but by not hard coding in to drop the land cover layer, this function is scalable and reusable
+  
+  predictors_cv <- terra::subset(predictors, cat_layers, negate = TRUE) # drop them womp womp but not for long because we never use this new predictors_cv variable outside of the cv_spatial function
+
+  cv_folds <- cv_spatial( # run stupid rigid function to determine cross-validation folds
+    x = sdm_data_pts,
+    column = "PA", # Column with binary presence/absence data
+    r = predictors_cv, #freaky predicotrs go here!
+    k = n_folds,
+    selection = "random",
+    iteration = 50,
+    progress = TRUE
+  )
+  
+  # Train Maxnet model
+  model <- SDMtune::train(method = modelmethod, data = sdm_data, folds = cv_folds) 
+
+  # Predict
+  prediction <- predict(model, data = predictors, type = "cloglog")
+
+  # Variable importance
+  vi <- varImp(model, permut = 5)
+  
+  #browser()
+  
+  # Variable importance plot
+  varimp.plot <- ggplot(vi, mapping = aes(forcats::fct_reorder(Variable, Permutation_importance, .desc = T), Permutation_importance)) +
+  geom_col(fill = "#EDB183") +
+  labs(x = "", y = "Relative Variable Importance") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title.x = element_text(size = 20, face = "bold")
+  )
+  
+  # Response curves
+  most_imp_vars <- vi |>
+    slice_max(Permutation_importance, n = 4) |>
+    pull(Variable)
+
+  safe_response_curves <- safely(function(var) {
+    plotResponse(model, var, type = "cloglog")})
+
+  response_curves <- map(most_imp_vars, safe_response_curves)
+
+  rc_plots <- response_curves |>
+    map("result") |>
+    compact() |>
+    patchwork::wrap_plots()
+
+  # Save outputs
+  saveRDS(model, file = file.path(species_dir, "sdm_model.rds"))
+  writeRaster(prediction, file.path(species_dir, "default_prediction.tif"), overwrite = TRUE)
+  write.csv(vi, file.path(species_dir, "var_imp.csv"), row.names = FALSE)
+  write.csv(sdm_data_pts, file.path(species_dir, "sdm_pts.csv"), row.names = FALSE)
+  writeRaster(bias_rast[[2]], file.path(results_dir, "sampling_bias.tif"), overwrite = TRUE)
+  ggsave(
+      filename = file.path(results_dir, "varImpPlot.png"),
+      plot = varimp.plot,
+      width = 6, height = 5
+    )
+  ggsave(
+    filename = file.path(results_dir, "responseCurves.png"),
+    plot = rc_plots,
+    width = 10, height = 8
+  )
+  
+  message("Modeling complete for ", species_name)
+  
+  return(model)
+}
+```
+
+### Running
+
+Finally, let's actually make the model!! Change the name of the model to some sort of abbreviation of your species
+
+```{r}
+quercus_maxent_model <- train_sdm(species_name = species_list, #CHANGe model name
+                                  clean_occ_sf = clean_occ_sf, 
+                                  predictors = predictors, 
+                                  results_dir = results_dir,
+                                  n_bg_points, n_folds,
+                                  modelmethod = 'Maxnet'
+)
+```
+
+## Testing Function
+
+### Training
+
+This returns a whole bunch of metrics measuring the model.
+
+AUC measures the model's ability to distinguish between presences and absences (or background points). It ranges from 0.5 (no better than random) to 1.0 (perfect discrimination)
+
+TSS = Sensitivity + Specificity - 1. Essentially, it measures the balance between true positive and true negative rates. Returns of 1 means a perfect prediction, 0 is no better than random, and \<0 is worse than random :(. It is less affected by prevalence than AUC, so it is a good threshold-based metric. A TSS of \> 0.5 is ~often~ considered acceptable in ecology but it is also very arbitrary and should be considered for each case.
+
+AICc is ONLY comparable BETWEEN models trained on the SAME data and estimates model quality by penalizing complexity and poor fit. a lower AICc means better trade-off between goodness-of-fit and simplicity.
+
+The ROC curve visually represents the model’s ability to separate presence from absence across all thresholds. The closer the curve gets to the top-left corner, the better the model performs. It's essentiually a different visualization of AUC (area under the ROC curve)
+
+```{r}
+evaluate_sdm <- function(modelname, environment, results_dir){
+  
+  metrics_dir <- file.path(results_dir, "metrics")
+  dir.create(metrics_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  n_folds <- seq_along(modelname@models)
+  
+  message("-----Area Under the Curve (AUC)-----")
+  auc <- auc(modelname)
+  print(auc)
+  
+  message("-----True Skill Statistic (TSS)-----")
+  tss<- tss(modelname)
+  print(tss)
+  
+    # browser()
+  
+  message("-----Akaike Information Criterion (AIC), corrected for small samples-----")
+  aic_list <- vector("list", length(n_folds))
+  for (i in n_folds) {
+    aic_list[[i]] <- aicc(modelname@models[[i]], env = environment)
+    print(aic_list[[i]])
+    }
+  
+  metrics_df <- data.frame( #Combine metrics into one data frame
+    Fold = n_folds,
+    AUC = rep(auc_val, length(n_folds)),   # same AUC for all folds
+    TSS = rep(tss_val, length(n_folds)),   # same TSS for all folds
+    AICc = aic_list
+  )
+  
+  write.csv(metrics_df, # Save to CSV
+            file = file.path(metrics_dir, "model_evaluation_metrics.csv"),
+            row.names = FALSE)
+
+  message("-----Receiver Operating Characteristic (ROC) Curves-----")
+  message("See Plots window, right")
+  
+  for (i in n_folds) {
+    roc_graph <- plotROC(modelname@models[[i]])
+    
+    if ("gg" %in% class(roc_graph)) {
+      roc_graph <- roc_graph + ggtitle(paste("ROC - Fold", i))
+    }
+    
+    ggsave(
+      filename = file.path(metrics_dir, paste0("ROC_Fold_", i, ".png")),
+      plot = roc_graph,
+      width = 6, height = 5, dpi = 300
+    )
+  }
+  
+  invisible(metrics_df)
+}
+```
+
+### Running
+
+Let's evaluate!
+
+```{r}
+evaluate_sdm(modelname = species_maxent_model, environment = predictors) #CHANGE to whatever your model is named
+```
+
+## Boostrapping
+
+How do we make sure our model is statistically sound? BOOTSTRAPPING!! Esentially, we run (a slightly different version of) the model over and over again, and each time it will split the data into folds differently, so the models will be slightly different. Then, we compare all the models and see where the most differences show up. Those places have the least certainty, so hypothetically making more observations at those locations should increase model certainty.
+
+### Slightly new function
+
+```{r}
+bootstrap_sdm <- function(
+    species_name, clean_occ_sf, predictors, results_dir,
+    n_bg_points = 10000, modelmethod = "Maxnet",
+    n_bootstrap = 10) {
+  message("\n--- Modeling: ", species_name, " ---")  
+  bootstrap_dir <- file.path(results_dir, paste0("bootstrapped_", gsub(" ", "_", species_name)))
+  dir.create(bootstrap_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  #browser()
+  
+  # Check CRS
+  if (!terra::same.crs(predictors, st_as_sf(clean_occ_sf))) {
+    stop("CRS mismatch between predictors and occurrences.")
+  }
+  
+  ## Bias raster creation
+  message("\n--- Creating Bias Raster for: ", species_name, " ---")  
+  occ_thinned <- clean_occ_sf |>  # thin the data to binary each cell; reduce spatial bias by ensuring only one point per raster cell.
+    mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |> 
+    group_by(cell) |> 
+    sample_n(1) |> 
+    ungroup()
+  
+  coords <- st_coordinates(occ_thinned) # extract coordinates
+  empty_rast <- predictors[[1]] # create a new raster, the same size as the predictors
+  
+  point_dens <- MASS::kde2d( #density function, essentially takes thinned data and creates a density est
+    coords[, 1], coords[, 2],
+    n = c(ncol(empty_rast), nrow(empty_rast)), #Number of grid points in X and Y directions (matches the raster size)
+    lims = ext(empty_rast) |> as.vector()
+  )
+  point_dens_df <- expand.grid(x = point_dens$x, y = point_dens$y, KEEP.OUT.ATTRS = FALSE) #creates df of all combos of x,y in point_dens
+  point_dens_df$z <- as.vector(point_dens$z) #Convert KDE output to a tidy data frame
+  
+  density_rast <- rast(point_dens_df, type = "xyz", crs = crs(predictors)) |> #raster of the density
+    project(crs(predictors))
+  bias_rast <- density_rast |> resample(predictors, method = "bilinear") |> #take density raster and make it the bias raster by making it the same size of the predictors via bilinear interpolation
+    mask(predictors)
+  
+  ##Background points
+  occ_boot <- clean_occ_sf |> #new sf 
+    mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |> #selecting a single occurrence per raster cell
+    group_by(cell) |> #chosen randomly
+    sample_n(1, replace = TRUE) |> #(with replacement) from possibly many points in the same cell
+    ungroup()
+  
+  sampled_cells <- sample( #randomly
+    x = which(!is.na(values(bias_rast))), #gives all NON NA values in the bias raster
+    size = n_bg_points, #how many bg points to make
+    prob = values(bias_rast)[!is.na(values(bias_rast))], # probability weight from bias raster, only considering existing values (no NAs)
+    replace = TRUE) #WITH REPLACEMENT
+  
+  bg_df <- xyFromCell(predictors[[1]], sampled_cells) |>#matrix of the coordinates of the center points of the raster cells identified in sampled_cells
+    as_tibble() |> #make it a df
+    dplyr::select(x, y) #only keep x and y
+  
+  all_points <- occ_boot |> #take the randomly chosen occurrence, one per cell
+    st_drop_geometry() |> #drops the geometry
+    dplyr::select(x = decimalLongitude, y = decimalLatitude) |> #selects and renames coord columns
+    mutate(Y = 1) |> #makes all the occurence data have an "occurence"(Y) column value of TRUE(1)
+    bind_rows(bg_df |> #adds the background data
+                mutate(Y = 0)) #makes all the background/false absence data have a "occurence"(Y) column valye of False(0)
+  
+  sdm_data <- prepareSWD( #makes the data usable by sdmtune
+    species = species_name,
+    p = all_points |> filter(Y == 1) |> dplyr::select(x, y), #presence poitns
+    a = all_points |> filter(Y == 0) |> dplyr::select(x, y), #absence points
+    env = predictors #environmental data
+  )
+  
+  sdm_data_pts <- sdm_data@coords |> #select the points of prepared data
+    cbind(
+  sdm_data@coords,
+  sdm_data@data,
+  PA = sdm_data@pa)|> #takes and binds presence/absence data from sdm_data and rename it PA
+    st_as_sf(coords = c("X", "Y"), crs = crs(clean_occ_sf), remove = FALSE) #make it an sf, setting coordinates and geometry but keeping x, y columns
+  #so this now only has the points and if they represent a presence or absence
+  
+  point_count <- nrow(as.data.frame(sdm_data_pts))
+  
+  cat_layers <- which(sapply(1:nlyr(predictors), function(i) is.factor(predictors[[i]]))) #list of categorical predictor variables
+  predictors_cv <- terra::subset(predictors, cat_layers, negate = TRUE) #predictors without the categorical ones
+  
+  predictions_list <- vector("list", n_bootstrap) #empty list to dump the models into, with the length of the bootstrap repeats
+  final_model <- NULL # creates a name
+  varimp_list <- vector("list", n_bootstrap) #list to put the variable importances in
+  
+  ##Bootstrap loop
+  
+  #browser()
+  for (i in seq_len(n_bootstrap)) { #do this for however many times you want to bootstrap
+    message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
+    
+    #create a list of randomFolds-like matrices called MATRIX
+    #containing two matrices - training and testing
+    #matrices contain two columns - coordinates and "TRUE" column. if there were more than one fold, then k > 1
+    #matrix <- randomFolds(sdm_data, k = 1, only_presence = FALSE) #keeps prop of presence/absence same as origin data
+  
+    replicate_rows <- sdm_data_pts |>
+      slice_sample(n = point_count, replace = TRUE)|> #chooses the rows from which to randomly sample
+      as.data.frame()
+    
+    replicate_SWD <- prepareSWD( #have to remake the SWD because tou cant subset them boooo
+      species = species_name,
+      p = replicate_rows |> 
+        as.data.frame()|>
+        filter(PA == 1) |>
+        dplyr::select(X, Y)|>
+        rename(x = X, y = Y), #presence poitns just from the sampled rows
+      a = replicate_rows |> 
+        as.data.frame()|>
+        filter(PA == 0) |> 
+        dplyr::select(X, Y)|>
+        rename(x = X, y = Y), #absence points fro the same 
+     env = predictors) #environmental data
+    
+    #plug it into SDMtune::train
+    model <- SDMtune::train(method = modelmethod, data = replicate_SWD) # trains a model on the randomly assigned split data
+    
+    varimp_list[[i]] <- varImp(model, permut = 5) #stores variable importance for each model
+    
+    prediction <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model
+    predictions_list[[i]] <- prediction #stores it
+    
+    if (i == n_bootstrap) final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later
+  }
+  
+  message("-----Done Bootstrapping! Now creating VI plot-----")
+  ##Summarize all bootstrap predictions
+  all_varimp <- bind_rows(varimp_list, .id = "bootstrap") #combine the variable importance 
+  
+  varimp_summary <- all_varimp |> #
+    group_by(Variable) |>
+    summarise(
+      mean_importance = mean(Permutation_importance, na.rm = TRUE),
+      sd_importance = sd(Permutation_importance, na.rm = TRUE),
+      .groups = "drop")|>
+    arrange(desc(mean_importance))
+  
+  most_imp_vars <- varimp_summary |>
+    slice_head(n = 4) |>
+    pull(Variable)
+  
+  vi_plot <- 
+    ggplot(all_varimp, 
+           aes(x = forcats::fct_reorder(Variable, Permutation_importance, .desc = TRUE),
+               y = Permutation_importance)) +
+    geom_boxplot(fill = "#EDB183", alpha = 0.7) +
+    labs(
+      title = paste("Bootstrap Variable Importance:", species_name),
+      x = "", 
+      y = "Permutation Importance") +
+    coord_flip() +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title.y = element_blank(),
+      axis.title.x = element_text(size = 16, face = "bold"),
+      plot.title = element_text(size = 16, face = "bold")
+    )
+  
+  # safe_response_curves <- safely(function(var) plotResponse(final_model, var, type = "cloglog")) #function that wont break
+  # response_curves <- map(most_imp_vars, safe_response_curves) #from the final model, plot the variables that were most important across ALL models
+  # rc_plots <- response_curves |>
+  #   map("result") |>
+  #   compact() |>
+  #   patchwork::wrap_plots()
+  
+  pred_stack <- rast(predictions_list) #rasterize all of the predictions into a single stack
+  mean_pred <- mean(pred_stack) #mean prediction
+  sd_pred <- stdev(pred_stack) #sd of mean prediction
+  
+  message("------ Saving results...------")
+  #just save a whole bunch of things
+  writeRaster(pred_stack, file.path(bootstrap_dir, "bootstrap_all_predictions.tif"), overwrite = TRUE)
+  writeRaster(mean_pred, file.path(bootstrap_dir, "bootstrap_mean_prediction.tif"), overwrite = TRUE)
+  writeRaster(sd_pred, file.path(bootstrap_dir, "bootstrap_sd_prediction.tif"), overwrite = TRUE)
+  writeRaster(bias_rast[[1]], file.path(bootstrap_dir, "bias_raster.tif"), overwrite = TRUE)
+  write.csv(varimp_summary, file.path(bootstrap_dir, "bootstrap_var_imp_summary.csv"), row.names = FALSE)
+  ggsave(file.path(bootstrap_dir, "bootstrap_varImp_boxplot.png"),
+         plot = vi_plot, width = 8, height = 6)
+  saveRDS(final_model, file = file.path(bootstrap_dir, "final_model.rds"))
+  #ggsave(file.path(bootstrap_dir, "responseCurves.png"), plot = rc_plots, width = 10, height = 8)
+  
+  ## RETURN all key outputs 
+  return(list(
+    #data = final_data,
+    model = final_model,
+    mean_prediction = mean_pred,
+    sd_prediction = sd_pred,
+    pred_stack = pred_stack 
+  ))
+  
+  message("Finished bootstrapped modeling for ", species_name)
+}
+```
+
+By running this, you will get a list of 4 things under the name quercus boostrap: the model, and 3 SpatRasters; the mean prediction (quercus_bootstrap$mean_prediction), the standard deviations of the predictions: (quercus_bootstrap$sd_prediction), and a stack of every single prediction (here, 5) made while bootstrapping (quercus_bootstrap\$pred_stack)
+
+```{r}
+quercus_bootstrap <- bootstrap_sdm(
+    species_name = species_list, clean_occ_sf, predictors, results_dir,
+    n_bg_points = 10000, modelmethod = "Maxnet",
+    n_bootstrap = 5
+)
+
+boostrap_model <- quercus_bootstrap$model
+bootstrap_data <- quercus_bootstrap$data
+
+
+
+quercus_bootstrap_15 <- bootstrap_sdm(
+  species_name = species_list,
+  clean_occ_sf = clean_occ_sf,
+  predictors = predictors,
+  results_dir = results_dir,
+  n_bootstrap = 15  # e.g., more reps for stable uncertainty
+)
+```
+
+### Analysis Function
+
+To use this function, pull out the element of the list you just created called pred_stack, which is just a stack of all the reps you just made
+
+```{r}
+pred_stack <- quercus_bootstrap$pred_stack
+```
+
+Now take a look at this beauty:
+
+```{r}
+bootstrap_analysis <- function(pred_stack, results_dir) {
+  library(tmap) #for some reaason I have to include this here or it overlays everything else?
+  
+  browser()
+  
+  analysis_dir <- file.path(results_dir, "analysis")
+  dir.create(analysis_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Calculate mean prediction
+  mean_pred <- terra::app(pred_stack, mean, na.rm = TRUE) #the bootstrap function actually does this, but it decreases the number of arguments requeired
+  
+  # Calculate standard deviation (SD)
+  sd_pred <- terra::app(pred_stack, sd, na.rm = TRUE) #same as above
+  
+  # Calculate 95% confidence interval
+  ci_lower <- terra::app(pred_stack, function(x) quantile(x, probs = 0.025, na.rm = TRUE))
+  ci_upper <- terra::app(pred_stack, function(x) quantile(x, probs = 0.975, na.rm = TRUE))
+  
+  # Calculate Coefficient of Variation (CV)
+  cv_pred <- sd_pred / mean_pred 
+  
+  # Calculate ensemble presence agreement (using 0.5 threshold)
+  binary_stack <- pred_stack > 0.5 #ARBITRARY
+  ensemble_agreement <- terra::app(binary_stack, mean, na.rm = TRUE)
+  
+  # Save rasters
+  writeRaster(mean_pred, file.path(analysis_dir, "mean_prediction.tif"), overwrite = TRUE)
+  writeRaster(sd_pred, file.path(analysis_dir, "bootstrap_sd_prediction.tif"), overwrite = TRUE)
+  writeRaster(ci_lower, file.path(analysis_dir, "ci_lower_95.tif"), overwrite = TRUE)
+  writeRaster(ci_upper, file.path(analysis_dir, "ci_upper_95.tif"), overwrite = TRUE)
+  writeRaster(cv_pred, file.path(analysis_dir, "coefficient_of_variation.tif"), overwrite = TRUE)
+  writeRaster(ensemble_agreement, file.path(analysis_dir, "ensemble_presence_agreement.tif"), overwrite = TRUE)
+  
+  # Plot mean prediction and uncertainty overlay
+  tmap_mode("plot")
+  
+  mean_plot <- tm_shape(mean_pred) +
+    tm_raster(palette = "viridis", title = "Mean Prediction") +
+    tm_layout(main.title = "Mean Prediction")
+  
+  sd_plot <- tm_shape(sd_pred) +
+    tm_raster(palette = "-Greys", title = "Prediction SD") +
+    tm_layout(main.title = "Uncertainty (SD)")
+  
+  agreement_plot <- tm_shape(ensemble_agreement) +
+    tm_raster(palette = "YlGnBu", title = "Ensemble Presence Agreement") +
+    tm_layout(main.title = "Ensemble Presence Agreement")
+  
+  # Save plots as PNGs
+  tmap_save(mean_plot, file.path(analysis_dir, "mean_prediction.png"), width = 800, height = 600)
+  tmap_save(sd_plot, file.path(analysis_dir, "prediction_sd.png"), width = 800, height = 600)
+  tmap_save(agreement_plot, file.path(analysis_dir, "ensemble_presence_agreement.png"), width = 800, height = 600)
+  
+  message("Bootstrap prediction summaries saved to ", analysis_dir)
+  
+  # Return list of rasters invisibly
+  invisible(list(
+    mean = mean_pred,
+    sd = sd_pred,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    cv = cv_pred,
+    ensemble_agreement = ensemble_agreement
+  ))
+}
+```
+
+The thing is this function takes a LOOOOOONG time to load (i think it gets caught up on the quantile() function within terra::app? because it is doing upper and lower CI bounds for literally every single cell). so if time is an issue, just comment them out. they really don;t add much to the results anyway esp with SD already there....
+
+```{r}
+bootstrap_analysis(pred_stack = pred_stack, results_dir = results_dir)
+```
+
+### Pretty up a final graph
+
+```{r}
+#you dont have to do this part, mine just decided to forget what these were for some reason
+mean_prediction <- terra::rast("~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/Results/Quercus/27Jun25/bootstrapped_Quercus_agrifolia/bootstrap_mean_prediction.tif")
+sd_prediction <- terra::rast("~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/Results/Quercus/27Jun25/bootstrapped_Quercus_agrifolia/bootstrap_sd_prediction.tif")
+
+sd_prediction <- quercus_bootstrap$sd_prediction
+
+mean_df <- as.data.frame(mean_prediction, xy = TRUE, na.rm = TRUE)
+sd_df <- as.data.frame(sd_prediction, xy = TRUE, na.rm = TRUE)
+
+# Join the two data frames by x and y
+combined_df <- left_join(mean_df, sd_df, by = c("x", "y"))
+colnames(combined_df) <- c("x", "y", "mean", "sd")
+
+# Plot: grayscale background from mean, overlay sd as transparent color
+ggplot(combined_df, aes(x = x, y = y)) +
+  # Grayscale base: mean prediction
+  geom_raster(aes(fill = mean)) +
+  scale_fill_gradient(low = "black", high = "white", name = "Mean Prediction") +
+  new_scale_fill() +  # allows second fill scale using ggnewscale
+
+  # Overlay: color-coded SD with transparency
+  geom_raster(aes(fill = sd), alpha = 0.6) +
+  scale_fill_viridis_c(name = "SD of Prediction") +
+
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "right")
+```
+
+```{r}
+combined_rast <- c(mean_prediction, sd_prediction)
+names(combined_rast) <- c("mean", "sd")
+
+df <- as.data.frame(combined_rast, xy = TRUE, na.rm = TRUE)
+
+ggplot(df) +
+  geom_raster(aes(x = x, y = y, fill = mean, alpha = 1 - sd)) +
+  scale_fill_viridis_c(name = "Occurrence Probability") +
+  scale_alpha(range = c(0.3, 1), guide = "none") +
+  coord_equal() +
+  theme_minimal() +
+  labs(title = "Mean Occurrence with SD Transparency")
+```
+
+## Threshold
+
+```{r}
+# bootstrap_model <- readRDS("~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/Results/Quercus/27Jun25/bootstrapped_Quercus_agrifolia/bootstrap_model.rds")
+
+bootstrap_model <- quercus_bootstrap$model
+bootstrap_data <- quercus_bootstrap$data 
+
+single_layer <- bootstrap_model@models[[5]] #pull out a single model from the bootstrapped and cross validated model. MAKE SURE IT IS THE LAST MODEL (aka, put however many times you bootstrapped for the layer)
+class(single_layer) #should be SDMmodel NOT SDMmodelCV
+class(bootstrap_data) #should be a SWD type
+
+threshold <- thresholds(
+  model = single_layer,
+  type = "cloglog",
+  test = bootstrap_data) #this is a return from the bootstrap function, and represents teh data used for ONLY THE FINAL model
+
+threshold_value <- threshold$`Cloglog value`[threshold$Threshold == "Maximum test sensitivity plus specificity"]
+
+mean_prediction <- rast("~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/Results/Quercus/01Jul25/bootstrapped_Quercus_agrifolia/bootstrap_mean_prediction.tif")
+
+threshold_polygon <- classify(mean_prediction, 
+                              rbind(c(-Inf, threshold_value, 0), c(threshold_value, Inf, 1)))
+
+poly <- as.polygons(threshold_polygon, values = TRUE, dissolve = TRUE)
+polygon <- subset(poly, poly[[1]] == 1)|>
+  st_as_sf()
+
+plot(polygon)
+```
+
+### New graph
+
+#### Mean and points
+
+```{r}
+sd_prediction <- rast("~/Desktop/Summer 2025 - SSI at CAS/SSISummerCAS2025 R Project/Results/Quercus/01Jul25/bootstrapped_Quercus_agrifolia/bootstrap_sd_prediction.tif")
+
+mean_df <- as.data.frame(mean_prediction, xy = TRUE, na.rm = TRUE)
+sd_df <- as.data.frame(sd_prediction, xy = TRUE, na.rm = TRUE)
+names(sd_df)[3] <- "sd" 
+
+# Join the two data frames by x and y
+combined_df <- left_join(mean_df, sd_df, by = c("x", "y"))
+colnames(combined_df) <- c("x", "y", "mean", "sd")
+
+# Plot: grayscale background from mean, overlay sd as transparent color
+mean_pts_plot <- ggplot() +
+  # Grayscale base: mean prediction
+  geom_raster(combined_df, mapping = aes(x = x, y = y, fill = mean)) +
+  scale_fill_gradient(low = "orange", high = "blue", name = "Habitat Suitability") +
+  new_scale_fill() +  # allows second fill scale using ggnewscale
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "right")+
+  geom_point(data = points, mapping = aes(x = decimalLongitude, y = decimalLatitude, fill = "Presences"), color = 'black', size = 0.0001, alpha = 0.5)
+
+plot(mean_pts_plot)
+
+ggsave(file.path(results_dir, "mean_and_points.png"),
+       plot = mean_pts_plot, width = 8, height = 6)
+```
+
+#### sd and polygon
+
+```{r}
+# poly_raw <- as.polygons(threshold_polygon, values = TRUE)
+# presence_poly <- subset(poly_raw, poly_raw[[1]] == 1)
+# presence_poly_dissolved <- aggregate(presence_poly)
+
+# threshold_presences <-subset(threshold_df, mean == "1")|>
+#   select(x,y)
+
+# threshold_df <- as.data.frame(threshold_polygon, xy = TRUE)
+# plot(threshold_df)
+
+# threshold_presences_sf <- st_as_sf(threshold_presences, coords = c("x", "y"))
+
+# presence_polygon <- threshold_presences_sf$geometry |>
+#   st_union() |>
+#   st_convex_hull() |>
+#   # st_transform(3310) |> #this converts it to an area-preservation geometry so we can then make a buffer based on distance, not degrees.
+#   # st_buffer(50000) |>   #add a buffer of 50km
+#   st_make_valid() |>
+#   #st_transform(crs(clean_occ_sf))|>
+#   st_as_sf()
+
+sd_polygon_plot <- ggplot() +
+  # Base layer: standard deviation raster
+  geom_raster(data = sd_df, aes(x = x, y = y, fill = sd)) +
+  scale_fill_viridis_c(option = "viridis", name = "SD") +
+  # Overlay: suitable habitat polygon
+  geom_sf(data = polygon, fill = "white", alpha = 0.25, color = "white", linewidth = 0.1) +
+  # Theme and labels
+  theme_minimal() +
+  labs(title = "Standard Deviation with Suitable Habitat Outline") +
+  coord_sf()
+
+plot(sd_polygon_plot)
+
+ggsave(file.path(results_dir, "sd_and_polygon.png"),
+       plot = sd_polygon_plot, width = 8, height = 6)
+```
+
+#### High variance
+
+```{r}
+sd_values <- values(sd_prediction)
+high_variance_threshold <- quantile(sd_values, 0.75, na.rm = TRUE) #create cutoff for 75%
+
+
+presence_mask <- classify(mean_prediction, rbind(c(-Inf, threshold_value, 0), c(threshold_value, Inf, 1)))
+variance_mask <- classify(sd_prediction, rbind(c(-Inf, high_variance_threshold, 0), c(high_variance_threshold, Inf, 1)))
+combined_mask <- presence_mask * variance_mask
+
+#convert to polygon
+combined_poly <- as.polygons(combined_mask, values = TRUE, dissolve = TRUE)
+combined_poly <- subset(combined_poly, combined_poly[[1]] == 1)|>
+  st_as_sf()
+
+# custom_mask_sf <- st_as_sf(custom_mask)
+
+#pick the background of the graph - ideally whatever the highest impact variable is!! or whatever is relevant to sampling - maybe land cover? so you can tell where it would be easiest to sample more?
+env_df <- predictors[["wc2.1_30s_bio_1"]] |>
+  as.data.frame(xy = TRUE) |>
+  rename("env" = 3)
+
+intersection_plot <- ggplot() +
+  # Optional background raster (SD)
+  # geom_raster(data = mean_df, aes(x = x, y = y, fill = mean)) +
+  # scale_fill_viridis_c(option = "magma", name = "Mean Prediction") +
+  # Background Environemtnal variable
+  geom_raster(data = env_df, aes(x = x, y = y, fill = env)) +
+  scale_fill_gradient(name = "Mean Average Temperature", low = "black", high = "white") +
+  
+  theme(panel.background = element_rect(fill = "white")) +
+  # Overlay combined polygon: presence & high variance
+  geom_sf(data = combined_poly, fill = "red", alpha = 0.4, color = "darkred") +
+  
+  theme_minimal() +
+  labs(title = "Areas with High Variance & Predicted Presence") +
+  coord_sf()
+  
+plot(intersection_plot)
+
+ggsave(file.path(results_dir, "sd_threshold_intersection.png"),
+       plot = intersection_plot, width = 8, height = 6)
+```
