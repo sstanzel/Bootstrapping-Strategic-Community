@@ -46,8 +46,8 @@ n_bg_points <- 10000
 This is setting your file paths and where everything will save to, just go through and change every "species" to your specific species and the "date" to today's date
 
 ```{r}
-results_dir <- "~/R/Results/Quercus/03Jul25" # <-- CHANGE this to your desired output directory
-data_dir <- "~/R/Data/Quercus/03Jul25" # <-- CHANGE, this is where you will put all the data you used for this SDM
+results_dir <- "~/R/Results/Quercus/07Jul25" # <-- CHANGE this to your desired output directory
+data_dir <- "~/R/Data/Quercus/07Jul25" # <-- CHANGE, this is where you will put all the data you used for this SDM
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE) #<--- creates the directory you just set in case it doesnt exist already
 dir.create(data_dir, recursive = TRUE, showWarnings = FALSE) #<--- creates the directory you just set in case it doesnt exist already
@@ -782,16 +782,6 @@ quercus_bootstrap <- bootstrap_sdm(
 
 boostrap_model <- quercus_bootstrap$model
 bootstrap_data <- quercus_bootstrap$data
-
-
-
-quercus_bootstrap_15 <- bootstrap_sdm(
-  species_name = species_list,
-  clean_occ_sf = clean_occ_sf,
-  predictors = predictors,
-  results_dir = results_dir,
-  n_bootstrap = 15  # e.g., more reps for stable uncertainty
-)
 ```
 
 ### Analysis Function
