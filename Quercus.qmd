@@ -571,17 +571,50 @@ evaluate_sdm(modelname = species_maxent_model, environment = predictors) #CHANGE
 
 How do we make sure our model is statistically sound? BOOTSTRAPPING!! Esentially, we run (a slightly different version of) the model over and over again, and each time it will split the data into folds differently, so the models will be slightly different. Then, we compare all the models and see where the most differences show up. Those places have the least certainty, so hypothetically making more observations at those locations should increase model certainty.
 
-### Slightly new function
-
+### Replicate Function to nest inside full bootstrap
 ```{r}
-
-replicate_run <- function(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod) { #do this for however many times you want to bootstrap
-    message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
+replicate_run <- function(n_bootstrap, species_name, predictors, modelmethod, varimp_list, predictions_list, final_model, clean_occ_sf, bg_df, i) { #do this for however many times you want to bootstrap
+    #message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
     
     #create a list of randomFolds-like matrices called MATRIX
     #containing two matrices - training and testing
     #matrices contain two columns - coordinates and "TRUE" column. if there were more than one fold, then k > 1
     #matrix <- randomFolds(sdm_data, k = 1, only_presence = FALSE) #keeps prop of presence/absence same as origin data
+  
+  predictors <- unwrap(predictors)
+  
+    i = i+1
+    message("  Bootstrap ", i, "/", n_bootstrap)
+  
+    occ_boot <- clean_occ_sf |> #new sf 
+      mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |> #selecting a single occurrence per raster cell
+      group_by(cell) |> #chosen randomly SHOULD THIS BE HERE??
+      sample_n(1, replace = TRUE) |> #(with replacement) from possibly many points in the same cell
+      ungroup()
+  
+  all_points <- occ_boot |> #take the randomly chosen occurrence, one per cell
+    st_drop_geometry() |> #drops the geometry
+    dplyr::select(x = decimalLongitude, y = decimalLatitude) |> #selects and renames coord columns
+    mutate(Y = 1) |> #makes all the occurence data have an "occurence"(Y) column value of TRUE(1)
+    bind_rows(bg_df |> #adds the background data
+                mutate(Y = 0)) #makes all the background/false absence data have a "occurence"(Y) column valye of False(0)
+  
+  sdm_data <- prepareSWD( #makes the data usable by sdmtune
+    species = species_name,
+    p = all_points |> filter(Y == 1) |> dplyr::select(x, y), #presence poitns
+    a = all_points |> filter(Y == 0) |> dplyr::select(x, y), #absence points
+    env = predictors #environmental data
+  )
+  
+  sdm_data_pts <- sdm_data@coords |> #select the points of prepared data
+    cbind(
+  sdm_data@coords,
+  sdm_data@data,
+  PA = sdm_data@pa)|> #takes and binds presence/absence data from sdm_data and rename it PA
+    st_as_sf(coords = c("X", "Y"), crs = crs(clean_occ_sf), remove = FALSE) #make it an sf, setting coordinates and geometry but keeping x, y columns
+  #so this now only has the points and if they represent a presence or absence
+  
+  point_count <- nrow(as.data.frame(sdm_data_pts))
   
     replicate_rows <- sdm_data_pts |>
       slice_sample(n = point_count, replace = TRUE)|> #chooses the rows from which to randomly sample
@@ -605,15 +638,17 @@ replicate_run <- function(n_bootstrap, sdm_data_pts, species_name, point_count, 
     model <- SDMtune::train(method = modelmethod, data = replicate_SWD) # trains a model on the randomly assigned split data
     
     varimp_list[[i]] <- varImp(model, permut = 5) #stores variable importance for each model
+  
+    predictions_list[[i]] <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model and stores it
     
-    prediction <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model
-    predictions_list[[i]] <- prediction #stores it
+    message("---- Done with iteration ", i, "-----")
     
-    if (i == n_bootstrap) final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later
+    final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later. I had to change this once the loop was deleted - now it stores every model as the final one but only temporarily, so onyl the last one remains as the final_model
   }
+```
 
-
-
+### Bootrstrap Function
+```{r}
 bootstrap_sdm <- function(
     species_name, clean_occ_sf, predictors, results_dir,
     n_bg_points = 10000, modelmethod = "Maxnet",
@@ -622,6 +657,7 @@ bootstrap_sdm <- function(
   bootstrap_dir <- file.path(results_dir, paste0("bootstrapped_", gsub(" ", "_", species_name)))
   dir.create(bootstrap_dir, showWarnings = FALSE, recursive = TRUE)
   
+  library(furrr)
   #browser()
   
   # Check CRS
@@ -654,12 +690,6 @@ bootstrap_sdm <- function(
     mask(predictors)
   
   ##Background points
-  occ_boot <- clean_occ_sf |> #new sf 
-    mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |> #selecting a single occurrence per raster cell
-    group_by(cell) |> #chosen randomly
-    sample_n(1, replace = TRUE) |> #(with replacement) from possibly many points in the same cell
-    ungroup()
-  
   sampled_cells <- sample( #randomly
     x = which(!is.na(values(bias_rast))), #gives all NON NA values in the bias raster
     size = n_bg_points, #how many bg points to make
@@ -669,30 +699,7 @@ bootstrap_sdm <- function(
   bg_df <- xyFromCell(predictors[[1]], sampled_cells) |>#matrix of the coordinates of the center points of the raster cells identified in sampled_cells
     as_tibble() |> #make it a df
     dplyr::select(x, y) #only keep x and y
-  
-  all_points <- occ_boot |> #take the randomly chosen occurrence, one per cell
-    st_drop_geometry() |> #drops the geometry
-    dplyr::select(x = decimalLongitude, y = decimalLatitude) |> #selects and renames coord columns
-    mutate(Y = 1) |> #makes all the occurence data have an "occurence"(Y) column value of TRUE(1)
-    bind_rows(bg_df |> #adds the background data
-                mutate(Y = 0)) #makes all the background/false absence data have a "occurence"(Y) column valye of False(0)
-  
-  sdm_data <- prepareSWD( #makes the data usable by sdmtune
-    species = species_name,
-    p = all_points |> filter(Y == 1) |> dplyr::select(x, y), #presence poitns
-    a = all_points |> filter(Y == 0) |> dplyr::select(x, y), #absence points
-    env = predictors #environmental data
-  )
-  
-  sdm_data_pts <- sdm_data@coords |> #select the points of prepared data
-    cbind(
-  sdm_data@coords,
-  sdm_data@data,
-  PA = sdm_data@pa)|> #takes and binds presence/absence data from sdm_data and rename it PA
-    st_as_sf(coords = c("X", "Y"), crs = crs(clean_occ_sf), remove = FALSE) #make it an sf, setting coordinates and geometry but keeping x, y columns
-  #so this now only has the points and if they represent a presence or absence
-  
-  point_count <- nrow(as.data.frame(sdm_data_pts))
+
   
   cat_layers <- which(sapply(1:nlyr(predictors), function(i) is.factor(predictors[[i]]))) #list of categorical predictor variables
   predictors_cv <- terra::subset(predictors, cat_layers, negate = TRUE) #predictors without the categorical ones
@@ -700,23 +707,27 @@ bootstrap_sdm <- function(
   predictions_list <- vector("list", n_bootstrap) #empty list to dump the models into, with the length of the bootstrap repeats
   final_model <- NULL # creates a name
   varimp_list <- vector("list", n_bootstrap) #list to put the variable importances in
+  i = 0
+  
+#read terra raster into memory so cpus arent all pulling from memory version
+  #multithreading/parallelization terra raster (wrap?)
   
   ##Bootstrap loop
-
+  browser()
   print("Bootstrappign ... ")
+  
+  predictors <- wrap(predictors)
 
-  replicate_run(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod)
+  replicate_run(n_bootstrap, species_name, predictors, modelmethod, varimp_list, predictions_list, final_model, clean_occ_sf, bg_df, i)
+  
+  #availableCores()
+  plan(multisession, workers = 20)
 
-library(furrr)
-plan(multisession, workers = 20)
+  future_map(.x = 1:n_bootstrap, .f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod, varimp_list=varimp_list, predictions_list=predictions_list, final_model=final_model, clean_occ_sf=clean_occ_sf, bg_df=bg_df, i=i, .progress = TRUE, .options = furrr_options(seed = TRUE))
 
-
-future_map(1:n_bootstrap, .f = replicate_run(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod), .progress = TRUE)
-
-plan(sequential)
+  plan(sequential)
   
   #browser()
-  
   
   message("-----Done Bootstrapping! Now creating VI plot-----")
   ##Summarize all bootstrap predictions
@@ -788,13 +799,14 @@ plan(sequential)
 }
 ```
 
+
 By running this, you will get a list of 4 things under the name quercus boostrap: the model, and 3 SpatRasters; the mean prediction (quercus_bootstrap$mean_prediction), the standard deviations of the predictions: (quercus_bootstrap$sd_prediction), and a stack of every single prediction (here, 5) made while bootstrapping (quercus_bootstrap\$pred_stack)
 
 ```{r}
 quercus_bootstrap <- bootstrap_sdm(
     species_name = species_list, clean_occ_sf, predictors, results_dir,
     n_bg_points = 10000, modelmethod = "Maxnet",
-    n_bootstrap = 5
+    n_bootstrap = 10
 )
 
 
