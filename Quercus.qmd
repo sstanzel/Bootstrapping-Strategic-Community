@@ -574,6 +574,46 @@ How do we make sure our model is statistically sound? BOOTSTRAPPING!! Esentially
 ### Slightly new function
 
 ```{r}
+
+replicate_run <- function(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod) { #do this for however many times you want to bootstrap
+    message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
+    
+    #create a list of randomFolds-like matrices called MATRIX
+    #containing two matrices - training and testing
+    #matrices contain two columns - coordinates and "TRUE" column. if there were more than one fold, then k > 1
+    #matrix <- randomFolds(sdm_data, k = 1, only_presence = FALSE) #keeps prop of presence/absence same as origin data
+  
+    replicate_rows <- sdm_data_pts |>
+      slice_sample(n = point_count, replace = TRUE)|> #chooses the rows from which to randomly sample
+      as.data.frame()
+    
+    replicate_SWD <- prepareSWD( #have to remake the SWD because tou cant subset them boooo
+      species = species_name,
+      p = replicate_rows |> 
+        as.data.frame()|>
+        filter(PA == 1) |>
+        dplyr::select(X, Y)|>
+        rename(x = X, y = Y), #presence poitns just from the sampled rows
+      a = replicate_rows |> 
+        as.data.frame()|>
+        filter(PA == 0) |> 
+        dplyr::select(X, Y)|>
+        rename(x = X, y = Y), #absence points fro the same 
+     env = predictors) #environmental data
+    
+    #plug it into SDMtune::train
+    model <- SDMtune::train(method = modelmethod, data = replicate_SWD) # trains a model on the randomly assigned split data
+    
+    varimp_list[[i]] <- varImp(model, permut = 5) #stores variable importance for each model
+    
+    prediction <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model
+    predictions_list[[i]] <- prediction #stores it
+    
+    if (i == n_bootstrap) final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later
+  }
+
+
+
 bootstrap_sdm <- function(
     species_name, clean_occ_sf, predictors, results_dir,
     n_bg_points = 10000, modelmethod = "Maxnet",
@@ -662,44 +702,21 @@ bootstrap_sdm <- function(
   varimp_list <- vector("list", n_bootstrap) #list to put the variable importances in
   
   ##Bootstrap loop
+
+  print("Bootstrappign ... ")
+
+  replicate_run(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod)
+
+library(furrr)
+plan(multisession, workers = 20)
+
+
+future_map(1:n_bootstrap, .f = replicate_run(n_bootstrap, sdm_data_pts, species_name, point_count, predictors, modelmethod), .progress = TRUE)
+
+plan(sequential)
   
   #browser()
-  for (i in seq_len(n_bootstrap)) { #do this for however many times you want to bootstrap
-    message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
-    
-    #create a list of randomFolds-like matrices called MATRIX
-    #containing two matrices - training and testing
-    #matrices contain two columns - coordinates and "TRUE" column. if there were more than one fold, then k > 1
-    #matrix <- randomFolds(sdm_data, k = 1, only_presence = FALSE) #keeps prop of presence/absence same as origin data
   
-    replicate_rows <- sdm_data_pts |>
-      slice_sample(n = point_count, replace = TRUE)|> #chooses the rows from which to randomly sample
-      as.data.frame()
-    
-    replicate_SWD <- prepareSWD( #have to remake the SWD because tou cant subset them boooo
-      species = species_name,
-      p = replicate_rows |> 
-        as.data.frame()|>
-        filter(PA == 1) |>
-        dplyr::select(X, Y)|>
-        rename(x = X, y = Y), #presence poitns just from the sampled rows
-      a = replicate_rows |> 
-        as.data.frame()|>
-        filter(PA == 0) |> 
-        dplyr::select(X, Y)|>
-        rename(x = X, y = Y), #absence points fro the same 
-     env = predictors) #environmental data
-    
-    #plug it into SDMtune::train
-    model <- SDMtune::train(method = modelmethod, data = replicate_SWD) # trains a model on the randomly assigned split data
-    
-    varimp_list[[i]] <- varImp(model, permut = 5) #stores variable importance for each model
-    
-    prediction <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model
-    predictions_list[[i]] <- prediction #stores it
-    
-    if (i == n_bootstrap) final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later
-  }
   
   message("-----Done Bootstrapping! Now creating VI plot-----")
   ##Summarize all bootstrap predictions
@@ -779,6 +796,7 @@ quercus_bootstrap <- bootstrap_sdm(
     n_bg_points = 10000, modelmethod = "Maxnet",
     n_bootstrap = 5
 )
+
 
 boostrap_model <- quercus_bootstrap$model
 bootstrap_data <- quercus_bootstrap$data
