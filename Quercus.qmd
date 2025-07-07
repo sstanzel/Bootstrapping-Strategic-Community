@@ -25,6 +25,7 @@ library(geodata)
 library(spocc)
 library(plotROC)
 library(dplyr)
+library(furrr)
 ```
 
 ## Settings
@@ -573,18 +574,19 @@ How do we make sure our model is statistically sound? BOOTSTRAPPING!! Esentially
 
 ### Replicate Function to nest inside full bootstrap
 ```{r}
-replicate_run <- function(n_bootstrap, species_name, predictors, modelmethod, varimp_list, predictions_list, final_model, clean_occ_sf, bg_df, i) { #do this for however many times you want to bootstrap
+replicate_run <- function(x, n_bootstrap, species_name, predictors, modelmethod, clean_occ_sf, bg_df) { #do this for however many times you want to bootstrap
     #message("  Bootstrap ", i, "/", n_bootstrap) #gives a message saying when it is starting the next bootstrap
     
     #create a list of randomFolds-like matrices called MATRIX
     #containing two matrices - training and testing
     #matrices contain two columns - coordinates and "TRUE" column. if there were more than one fold, then k > 1
     #matrix <- randomFolds(sdm_data, k = 1, only_presence = FALSE) #keeps prop of presence/absence same as origin data
+  print(x)
   
   predictors <- unwrap(predictors)
   
-    i = i+1
-    message("  Bootstrap ", i, "/", n_bootstrap)
+    # i = i+1
+    message("  Bootstrap /", n_bootstrap)
   
     occ_boot <- clean_occ_sf |> #new sf 
       mutate(cell = cellFromXY(predictors, st_coordinates(clean_occ_sf))) |> #selecting a single occurrence per raster cell
@@ -637,13 +639,16 @@ replicate_run <- function(n_bootstrap, species_name, predictors, modelmethod, va
     #plug it into SDMtune::train
     model <- SDMtune::train(method = modelmethod, data = replicate_SWD) # trains a model on the randomly assigned split data
     
-    varimp_list[[i]] <- varImp(model, permut = 5) #stores variable importance for each model
+    # varimp_rep <- varImp(model, permut = 5) #stores variable importance for each model
   
-    predictions_list[[i]] <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model and stores it
+    # prediction_rep <- predict(model, data = predictors, type = "cloglog") #creates a prediction for each model and stores it
     
-    message("---- Done with iteration ", i, "-----")
+    # message("---- Done with iteration ", i, "-----")
     
-    final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later. I had to change this once the loop was deleted - now it stores every model as the final one but only temporarily, so onyl the last one remains as the final_model
+    # final_model <- model #some of the functions only work on models, not predictions, so storing the last model makes it easy to call it later. I had to change this once the loop was deleted - now it stores every model as the final one but only temporarily, so onyl the last one remains as the final_model
+    # output_list <- list(varimp = varimp_rep, prediction = prediction_rep, model = model)
+    # output_list <- list(model = model)
+    return(model)
   }
 ```
 
@@ -657,7 +662,6 @@ bootstrap_sdm <- function(
   bootstrap_dir <- file.path(results_dir, paste0("bootstrapped_", gsub(" ", "_", species_name)))
   dir.create(bootstrap_dir, showWarnings = FALSE, recursive = TRUE)
   
-  library(furrr)
   #browser()
   
   # Check CRS
@@ -704,27 +708,34 @@ bootstrap_sdm <- function(
   cat_layers <- which(sapply(1:nlyr(predictors), function(i) is.factor(predictors[[i]]))) #list of categorical predictor variables
   predictors_cv <- terra::subset(predictors, cat_layers, negate = TRUE) #predictors without the categorical ones
   
-  predictions_list <- vector("list", n_bootstrap) #empty list to dump the models into, with the length of the bootstrap repeats
-  final_model <- NULL # creates a name
-  varimp_list <- vector("list", n_bootstrap) #list to put the variable importances in
-  i = 0
+  # predictions_list <- vector("list", n_bootstrap) #empty list to dump the models into, with the length of the bootstrap repeats
+  # final_model <- NULL # creates a name
+  # varimp_list <- vector("list", n_bootstrap) #list to put the variable importances in
+  # i = 0
   
 #read terra raster into memory so cpus arent all pulling from memory version
   #multithreading/parallelization terra raster (wrap?)
   
   ##Bootstrap loop
-  browser()
+  
   print("Bootstrappign ... ")
   
   predictors <- wrap(predictors)
 
-  replicate_run(n_bootstrap, species_name, predictors, modelmethod, varimp_list, predictions_list, final_model, clean_occ_sf, bg_df, i)
+  # replicate_run(n_bootstrap, species_name, predictors, modelmethod, clean_occ_sf, bg_df)
   
   #availableCores()
-  plan(multisession, workers = 20)
+  # plan(multisession, workers = 10)
+  # plan(sequential)
 
-  future_map(.x = 1:n_bootstrap, .f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod, varimp_list=varimp_list, predictions_list=predictions_list, final_model=final_model, clean_occ_sf=clean_occ_sf, bg_df=bg_df, i=i, .progress = TRUE, .options = furrr_options(seed = TRUE))
-
+  tic()
+  browser()
+  1:2|>
+    future_map(.f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df, .progress = TRUE, .options = furrr_options(seed = TRUE))
+  # map(.x = 1:2,  replicate_run(x, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df), .progress = TRUE, .options = furrr_options(seed = TRUE))
+  # future_map(.x = 1:n_bootstrap, .f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df, .progress = TRUE, .options = furrr_options(seed = TRUE))
+  toc()
+  
   plan(sequential)
   
   #browser()
