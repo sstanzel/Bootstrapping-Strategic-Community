@@ -728,9 +728,11 @@ bootstrap_sdm <- function(
   # plan(multisession, workers = 10)
   # plan(sequential)
 
+  plan(multisession, workers = 20)
+  
   tic()
   browser()
-  1:2|>
+  model_list <- 1:n_bootstrap|>
     future_map(.f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df, .progress = TRUE, .options = furrr_options(seed = TRUE))
   # map(.x = 1:2,  replicate_run(x, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df), .progress = TRUE, .options = furrr_options(seed = TRUE))
   # future_map(.x = 1:n_bootstrap, .f = replicate_run, n_bootstrap=n_bootstrap, species_name=species_name, predictors=predictors, modelmethod=modelmethod,clean_occ_sf=clean_occ_sf, bg_df=bg_df, .progress = TRUE, .options = furrr_options(seed = TRUE))
